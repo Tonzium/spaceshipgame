@@ -20,7 +20,7 @@
     canvas.style.height = H + "px";
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   }
-  window.addEventListener("resize", () => { resize(); if (state === "menu") buildBackground(); });
+  window.addEventListener("resize", () => { resize(); buildBackground(); });
   resize();
 
   const $ = id => document.getElementById(id);
@@ -65,11 +65,18 @@
 
   // Rock tiers. Weight rises with level via `minLevel` and `weightPerLevel`.
   const TIERS = [
-    { name: "pebble",   rMin: 7,  rMax: 13,  weight: 3.0, minLevel: 0, weightPerLevel: -0.15, mass: 1,  hue: [200, 8, 55] },
-    { name: "rock",     rMin: 14, rMax: 26,  weight: 3.0, minLevel: 0, weightPerLevel: 0.0,   mass: 3,  hue: [30, 12, 42] },
-    { name: "asteroid", rMin: 30, rMax: 52,  weight: 1.0, minLevel: 1, weightPerLevel: 0.35,  mass: 9,  hue: [22, 18, 36] },
-    { name: "giant",    rMin: 62, rMax: 100, weight: 0.0, minLevel: 3, weightPerLevel: 0.28,  mass: 30, hue: [15, 14, 30] },
+    { name: "shard",    rMin: 4,  rMax: 8,   weight: 2.4, minLevel: 0, weightPerLevel: -0.08, mass: 0.4, hue: [210, 10, 70], speed: 1.9,  vxMul: 2.2, streak: true },
+    { name: "pebble",   rMin: 7,  rMax: 13,  weight: 3.0, minLevel: 0, weightPerLevel: -0.15, mass: 1,   hue: [200, 8, 55],  speed: 1.15, vxMul: 1.5 },
+    { name: "rock",     rMin: 14, rMax: 26,  weight: 3.0, minLevel: 0, weightPerLevel: 0.0,   mass: 3,   hue: [30, 12, 42],  speed: 1,    vxMul: 1 },
+    { name: "asteroid", rMin: 30, rMax: 52,  weight: 1.0, minLevel: 1, weightPerLevel: 0.35,  mass: 9,   hue: [22, 18, 36],  speed: 1,    vxMul: 1 },
+    { name: "giant",    rMin: 62, rMax: 100, weight: 0.0, minLevel: 3, weightPerLevel: 0.28,  mass: 30,  hue: [15, 14, 30],  speed: 0.75, vxMul: 1 },
   ];
+
+  // Hazards that unlock deeper in. Levels here are 0-based (displayed level minus one).
+  const HAZ = {
+    blackHole: { minLevel: 9, interval: [16, 26], horizon: [24, 38], G: 1.4e7, maxPull: 2200, drift: 0.32, maxOnScreen: 1 },
+    quasar:    { minLevel: 9, twinLevel: 14, firstDelay: 10, interval: [18, 30], idle: [2.5, 4.5], charge: 2.2, fire: 0.55, width: 54, shots: 3 },
+  };
 
   // ---------------------------------------------------------------------------
   // Utilities
@@ -138,6 +145,9 @@
   let elapsed = 0, level = 0, score = 0, distance = 0;
   let spawnTimer = 0, fieldTimer = 0, fieldBurst = 0;
   let shake = 0, flash = 0, deathTimer = 0;
+  let extAx = 0, extAy = 0;          // external acceleration on the ship this tick (gravity)
+  const holes = []; let holeTimer = 0;
+  let quasar = null; let quasarTimer = 0;
 
   const rocks = [], particles = [], popups = [];
   const stars = [[], [], []];   // three parallax layers
@@ -371,8 +381,8 @@
     const r = rand(tier.rMin, tier.rMax);
     const speedFactor = burst ? rand(0.9, 1.15) : rand(0.75, 1.25);
     const scroll = scrollSpeed();
-    const vy = scroll * speedFactor * (tier === TIERS[0] ? 1.15 : tier === TIERS[3] ? 0.75 : 1);
-    const vx = rand(-1, 1) * (20 + level * 6) * (tier === TIERS[0] ? 1.5 : 1);
+    const vy = scroll * speedFactor * tier.speed;
+    const vx = rand(-1, 1) * (20 + level * 6) * tier.vxMul;
     for (let attempt = 0; attempt < 8; attempt++) {
       const x = rand(r, W - r), y = -r - rand(0, 40);
       let ok = true;
@@ -429,6 +439,14 @@
   }
 
   function drawRock(r) {
+    if (r.tier.streak) {
+      const sp = Math.hypot(r.vx, r.vy) || 1, L = r.r * 6 + sp * 0.04;
+      const ex = r.x - (r.vx / sp) * L, ey = r.y - (r.vy / sp) * L;
+      const g = ctx.createLinearGradient(r.x, r.y, ex, ey);
+      g.addColorStop(0, "rgba(200,220,255,0.55)"); g.addColorStop(1, "rgba(200,220,255,0)");
+      ctx.strokeStyle = g; ctx.lineWidth = r.r * 1.3; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(r.x, r.y); ctx.lineTo(ex, ey); ctx.stroke();
+    }
     ctx.save();
     ctx.translate(r.x, r.y);
     ctx.rotate(r.rot);
@@ -477,7 +495,7 @@
     if (ship.thrustingR) ax += c.thrust;
     if (ship.thrustingU) ay -= c.thrustY;
     if (ship.thrustingD) ay += c.thrustY;
-    ship.vx += ax * dt; ship.vy += ay * dt;
+    ship.vx += (ax + extAx) * dt; ship.vy += (ay + extAy) * dt;
 
     // RCS auto-stabilizer: gentle exponential damping so the ship is controllable, plus a hard brake
     const damp = ship.braking ? c.brakeDamping : c.rcsDamping;
@@ -495,7 +513,8 @@
     if (ship.x < hw) { ship.x = hw; ship.vx = Math.abs(ship.vx) * c.bounce; }
     if (ship.x > W - hw) { ship.x = W - hw; ship.vx = -Math.abs(ship.vx) * c.bounce; }
     const yMin = H * c.minYFrac, yMax = H * c.maxYFrac - ship.h / 2;
-    if (ship.y < yMin) { ship.y = yMin; ship.vy = Math.abs(ship.vy) * c.bounce; }
+    // A strong gravity pull may drag the ship out of its flight band toward the hole
+    if (ship.y < yMin && extAy > -300) { ship.y = yMin; ship.vy = Math.abs(ship.vy) * c.bounce; }
     if (ship.y > yMax) { ship.y = yMax; ship.vy = -Math.abs(ship.vy) * c.bounce; }
 
     // Visual bank angle follows lateral velocity
@@ -650,6 +669,7 @@
     spawnTimer = 0.6; fieldTimer = rand(8, 14); fieldBurst = 0;
     shake = 0; flash = 0; deathTimer = 0;
     rocks.length = 0; particles.length = 0; popups.length = 0;
+    holes.length = 0; holeTimer = 0; quasar = null; quasarTimer = HAZ.quasar.firstDelay;
     buildBackground();
     resetShip();
     keys.clear();
@@ -708,6 +728,7 @@
 
     if (state === "dying") {
       deathTimer -= dt;
+      updateHazards(dt, false);
       updateRocks(dt);
       if (deathTimer <= 0) endGame();
       return;
@@ -721,6 +742,7 @@
     score += scroll * dt * CFG.distanceScore;
 
     readInput();
+    updateHazards(dt, true);
     updateShip(dt);
 
     // Spawning: steady stream plus occasional dense fields
@@ -758,6 +780,241 @@
         spawnDust(ship.x + (r.x > ship.x ? ship.w / 2 : -ship.w / 2), ship.y, 5, r);
       }
     }
+  }
+
+
+  // ---------------------------------------------------------------------------
+  // Hazards: black holes and quasars
+  // ---------------------------------------------------------------------------
+  const TAU = Math.PI * 2;
+
+  function makeHole() {
+    const R = rand(HAZ.blackHole.horizon[0], HAZ.blackHole.horizon[1]);
+    const parts = [];
+    for (let i = 0; i < 26; i++) parts.push({ a: Math.random() * TAU, r: R * rand(1.3, 3.2), w: rand(1.5, 3) });
+    return { x: rand(R * 3, W - R * 3), y: -R * 3, vx: rnd11() * 12, vy: scrollSpeed() * HAZ.blackHole.drift, R, spin: 0, tilt: rand(-0.4, 0.4), parts };
+  }
+
+  // Gravity: a = G / d^2 toward the hole, capped so the sim stays stable inside the horizon
+  function pull(h, x, y) {
+    const dx = h.x - x, dy = h.y - y;
+    const real = Math.sqrt(dx * dx + dy * dy) || 0.001;
+    const d2 = Math.max(real * real, h.R * h.R);   // clamp only the force, not the reported distance
+    const a = Math.min(HAZ.blackHole.G / d2, HAZ.blackHole.maxPull);
+    return { ax: (dx / real) * a, ay: (dy / real) * a, d: real };
+  }
+
+  function updateHoles(dt, shipAlive) {
+    extAx = 0; extAy = 0;
+    for (let i = holes.length - 1; i >= 0; i--) {
+      const h = holes[i];
+      h.x += h.vx * dt; h.y += h.vy * dt; h.spin += dt * 2.4;
+      if (h.y - h.R * 3.5 > H) { holes.splice(i, 1); continue; }
+      for (const p of h.parts) {
+        p.a += dt * (1 + 6 * (h.R / p.r));
+        p.r -= dt * (10 + h.R * 0.9 * (h.R / p.r));
+        if (p.r < h.R * 1.02) { p.r = h.R * rand(2.4, 3.3); p.a = Math.random() * TAU; }
+      }
+      if (shipAlive) {
+        const g = pull(h, ship.x, ship.y);
+        extAx += g.ax; extAy += g.ay;
+        if (g.d < h.R * 0.95) {   // nothing protects you from an event horizon
+          ship.hull = 0;
+          for (let k = 0; k < 60; k++) {
+            const a = Math.random() * TAU, sp = rand(20, 120);
+            particles.push({ x: ship.x, y: ship.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: rand(0.4, 1.2), age: 0, r: rand(1.5, 3.5), col: k % 3 ? "hull" : "flame" });
+          }
+          popup(h.x, h.y - h.R * 3.4, "CONSUMED", "#ff5d5d");
+          shake = 22; flash = 0.3;
+          state = "dying"; deathTimer = 1.8;
+        }
+      }
+      for (let j = rocks.length - 1; j >= 0; j--) {
+        const r = rocks[j];
+        const g = pull(h, r.x, r.y);
+        r.vx += g.ax * dt * 0.7; r.vy += g.ay * dt * 0.7;
+        if (g.d < h.R + r.r * 0.3) { spawnDust(r.x, r.y, Math.min(14, 4 + r.r * 0.2), r); rocks.splice(j, 1); }
+      }
+    }
+  }
+
+  function drawHole(h, t) {
+    const R = h.R;
+    // gravitational darkening / lensing halo
+    let g = ctx.createRadialGradient(h.x, h.y, R * 0.9, h.x, h.y, R * 3.4);
+    g.addColorStop(0, "rgba(0,0,0,0.9)"); g.addColorStop(0.45, "rgba(12,6,24,0.4)"); g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(h.x, h.y, R * 3.4, 0, TAU); ctx.fill();
+    // infalling matter
+    for (const p of h.parts) {
+      const k = clamp((p.r / R - 1) / 2.2, 0, 1);
+      ctx.fillStyle = `hsla(${25 + 30 * k},100%,${60 + 30 * (1 - k)}%,${0.4 + 0.6 * (1 - k)})`;
+      ctx.beginPath(); ctx.arc(h.x + Math.cos(p.a) * p.r, h.y + Math.sin(p.a) * p.r * 0.55, p.w * (1.3 - k * 0.6), 0, TAU); ctx.fill();
+    }
+    ctx.save();
+    ctx.translate(h.x, h.y); ctx.rotate(h.tilt);
+    const rx = R * 2.2, ry = R * 0.5, seg = 28;
+    // accretion disk with relativistic beaming: the side rotating toward us is brighter
+    const disk = (front) => {
+      for (let i = 0; i < seg; i++) {
+        const a0 = (i / seg) * TAU, a1 = a0 + TAU / seg + 0.03;
+        const mid = a0 + TAU / seg / 2;
+        if (front !== (Math.sin(mid) > 0)) continue;
+        const b = 0.5 + 0.5 * Math.cos(mid - h.spin);
+        ctx.strokeStyle = `hsla(${22 + 30 * b},100%,${45 + 45 * b}%,${0.75 + 0.25 * b})`;
+        ctx.lineWidth = R * (0.45 + 0.25 * b);
+        ctx.beginPath(); ctx.ellipse(0, 0, rx, ry, 0, a0, a1); ctx.stroke();
+      }
+    };
+    disk(false);
+    // event horizon
+    ctx.fillStyle = "#000"; ctx.beginPath(); ctx.arc(0, 0, R, 0, TAU); ctx.fill();
+    // photon ring
+    ctx.strokeStyle = `rgba(255,225,190,${0.55 + 0.25 * Math.sin(t * 6)})`; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(0, 0, R * 1.06, 0, TAU); ctx.stroke();
+    disk(true);
+    ctx.restore();
+  }
+
+  // --- Quasar ------------------------------------------------------------------
+  function makeQuasar(twin) {
+    const x = rand(W * 0.2, W * 0.8), y = rand(70, 150);
+    const cores = twin ? [{}, {}] : [{}];
+    return { x, y, vy: scrollSpeed() * 0.05, twin, cores, orbit: Math.random() * TAU, jet: rand(-0.5, 0.5), phase: "idle", t: rand(HAZ.quasar.idle[0], HAZ.quasar.idle[1]), shots: 0, beams: [], hitShip: false, alpha: 0 };
+  }
+  function corePos(q, i) {
+    if (!q.twin) return { x: q.x, y: q.y };
+    const a = q.orbit + (i ? Math.PI : 0);
+    return { x: q.x + Math.cos(a) * 34, y: q.y + Math.sin(a) * 12 };
+  }
+  // Distance from a point to a ray (origin + unit direction, forward only)
+  function pointRayDist(px, py, ox, oy, dx, dy) {
+    const t = Math.max(0, (px - ox) * dx + (py - oy) * dy);
+    const ex = ox + dx * t - px, ey = oy + dy * t - py;
+    return Math.hypot(ex, ey);
+  }
+  function aimBeams(q) {
+    q.beams = q.cores.map((c, i) => {
+      const o = corePos(q, i);
+      const spread = q.twin ? (i ? 1 : -1) * rand(60, 160) : 0;
+      const tx = clamp(ship.x + rnd11() * 60 + spread, 40, W - 40), ty = ship.y;
+      const dx = tx - o.x, dy = ty - o.y, L = Math.hypot(dx, dy) || 1;
+      return { ox: o.x, oy: o.y, dx: dx / L, dy: dy / L };
+    });
+  }
+
+  function updateQuasar(dt, shipAlive) {
+    const q = quasar, Q = HAZ.quasar;
+    q.y += q.vy * dt; q.orbit += dt * 1.6;
+    q.alpha = Math.min(1, q.alpha + dt * 0.8);
+    q.t -= dt;
+    if (q.phase === "idle" && q.t <= 0) {
+      if (q.shots >= Q.shots || q.y > H * 0.5 || !shipAlive) { q.phase = "leaving"; q.t = 2.5; }
+      else { q.phase = "charge"; q.t = Q.charge; aimBeams(q); popup(q.x, q.y + 40, q.twin ? "TWIN QUASAR LOCKED ON" : "QUASAR LOCKED ON", "#ff6b6b"); }
+    } else if (q.phase === "charge") {
+      for (let i = 0; i < q.beams.length; i++) { const o = corePos(q, i); q.beams[i].ox = o.x; q.beams[i].oy = o.y; }
+      if (q.t <= 0) { q.phase = "fire"; q.t = Q.fire; q.hitShip = false; shake = Math.max(shake, 8); flash = Math.max(flash, 0.12); }
+    } else if (q.phase === "fire") {
+      const half = Q.width / 2;
+      for (const b of q.beams) {
+        for (let j = rocks.length - 1; j >= 0; j--) {
+          const r = rocks[j];
+          if (pointRayDist(r.x, r.y, b.ox, b.oy, b.dx, b.dy) < half + r.r * 0.7) { explodeRock(r, 0.8); rocks.splice(j, 1); }
+        }
+        if (shipAlive && !q.hitShip && ship.invuln <= 0) {
+          let hit = false;
+          for (const p of ship.poly) if (pointRayDist(p.x, p.y, b.ox, b.oy, b.dx, b.dy) < half) { hit = true; break; }
+          if (hit) {
+            q.hitShip = true;
+            ship.hull -= 1; shake = 16; flash = 0.35;
+            ship.vx += b.dx * 260; ship.vy += b.dy * 120;
+            if (ship.hull <= 0) { explodeShip(); state = "dying"; deathTimer = 1.6; shake = 26; }
+            else { ship.invuln = CFG.ship.invulnTime; popup(ship.x, ship.y - 50, "BEAM HIT  HULL -1", "#ff5d5d"); }
+          }
+        }
+      }
+      if (q.t <= 0) { q.phase = "idle"; q.shots++; q.t = rand(Q.idle[0], Q.idle[1]); }
+    } else if (q.phase === "leaving") {
+      q.alpha = Math.max(0, q.alpha - dt * 0.5);
+      if (q.t <= 0) quasar = null;
+    }
+  }
+
+  function updateHazards(dt, shipAlive) {
+    updateHoles(dt, shipAlive);
+    if (quasar) updateQuasar(dt, shipAlive);
+    if (!shipAlive) return;
+    if (level >= HAZ.blackHole.minLevel) {
+      holeTimer -= dt;
+      if (holeTimer <= 0) {
+        if (holes.length < HAZ.blackHole.maxOnScreen) { holes.push(makeHole()); popup(W / 2, H * 0.22, "GRAVITY WELL", "#c084fc"); }
+        holeTimer = rand(HAZ.blackHole.interval[0], HAZ.blackHole.interval[1]);
+      }
+    }
+    if (level >= HAZ.quasar.minLevel && !quasar) {
+      quasarTimer -= dt;
+      if (quasarTimer <= 0) {
+        quasar = makeQuasar(level >= HAZ.quasar.twinLevel);
+        quasarTimer = rand(HAZ.quasar.interval[0], HAZ.quasar.interval[1]);
+      }
+    }
+  }
+
+  function drawQuasar(q, t) {
+    const Q = HAZ.quasar;
+    const charge = q.phase === "charge" ? 1 - q.t / Q.charge : q.phase === "fire" ? 1 : 0;
+    ctx.save();
+    ctx.globalAlpha = q.alpha;
+    // host galaxy glow
+    let g = ctx.createRadialGradient(q.x, q.y, 0, q.x, q.y, 110);
+    g.addColorStop(0, "rgba(120,160,255,0.22)"); g.addColorStop(1, "rgba(120,160,255,0)");
+    ctx.fillStyle = g; ctx.fillRect(q.x - 110, q.y - 110, 220, 220);
+    for (let i = 0; i < q.cores.length; i++) {
+      const c = corePos(q, i);
+      // relativistic jets
+      const jl = 90 + 50 * charge, ja = q.jet + (q.twin ? (i ? 0.6 : -0.6) : 0);
+      for (const sgn of [-1, 1]) {
+        const ex = c.x + Math.cos(ja + Math.PI / 2) * jl * sgn, ey = c.y + Math.sin(ja + Math.PI / 2) * jl * sgn;
+        const jg = ctx.createLinearGradient(c.x, c.y, ex, ey);
+        jg.addColorStop(0, `rgba(170,215,255,${0.6 + 0.3 * charge})`); jg.addColorStop(1, "rgba(170,215,255,0)");
+        ctx.strokeStyle = jg; ctx.lineWidth = 5 + 4 * charge; ctx.lineCap = "round";
+        ctx.beginPath(); ctx.moveTo(c.x, c.y); ctx.lineTo(ex, ey); ctx.stroke();
+      }
+      // core
+      const cr = 16 + 10 * charge + 2 * Math.sin(t * 12);
+      g = ctx.createRadialGradient(c.x, c.y, 0, c.x, c.y, cr);
+      g.addColorStop(0, "#ffffff"); g.addColorStop(0.35, "rgba(200,235,255,0.9)"); g.addColorStop(0.7, "rgba(120,180,255,0.5)"); g.addColorStop(1, "rgba(120,180,255,0)");
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(c.x, c.y, cr, 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawBeams(q, t) {
+    const Q = HAZ.quasar;
+    if (q.phase !== "charge" && q.phase !== "fire") return;
+    ctx.save();
+    for (const b of q.beams) {
+      const ex = b.ox + b.dx * 2600, ey = b.oy + b.dy * 2600;
+      if (q.phase === "charge") {
+        const k = 1 - q.t / Q.charge;
+        const a = 0.18 + 0.22 * k + 0.15 * Math.sin(t * (10 + 20 * k));
+        ctx.strokeStyle = `rgba(255,70,70,${a})`; ctx.lineWidth = Q.width; ctx.setLineDash([]);
+        ctx.beginPath(); ctx.moveTo(b.ox, b.oy); ctx.lineTo(ex, ey); ctx.stroke();
+        ctx.strokeStyle = `rgba(255,120,120,${0.5 + 0.4 * k})`; ctx.lineWidth = 1.5;
+        ctx.setLineDash([14, 10]); ctx.lineDashOffset = -t * 120;
+        const nx = -b.dy * Q.width / 2, ny = b.dx * Q.width / 2;
+        ctx.beginPath(); ctx.moveTo(b.ox + nx, b.oy + ny); ctx.lineTo(ex + nx, ey + ny); ctx.moveTo(b.ox - nx, b.oy - ny); ctx.lineTo(ex - nx, ey - ny); ctx.stroke();
+      } else {
+        const k = q.t / Q.fire, w = Q.width * (0.6 + 0.4 * Math.sin(k * Math.PI));
+        ctx.globalCompositeOperation = "lighter"; ctx.setLineDash([]); ctx.lineCap = "round";
+        ctx.strokeStyle = "rgba(90,170,255,0.35)"; ctx.lineWidth = w * 2.2;
+        ctx.beginPath(); ctx.moveTo(b.ox, b.oy); ctx.lineTo(ex, ey); ctx.stroke();
+        ctx.strokeStyle = "rgba(150,225,255,0.85)"; ctx.lineWidth = w;
+        ctx.beginPath(); ctx.moveTo(b.ox, b.oy); ctx.lineTo(ex, ey); ctx.stroke();
+        ctx.strokeStyle = "rgba(255,255,255,0.95)"; ctx.lineWidth = w * 0.35;
+        ctx.beginPath(); ctx.moveTo(b.ox, b.oy); ctx.lineTo(ex, ey); ctx.stroke();
+      }
+    }
+    ctx.restore();
   }
 
   // ---------------------------------------------------------------------------
@@ -804,7 +1061,7 @@
     for (const r of rocks) { r.y += r.vy * dt; r.rot += r.spin * dt; updateRockPolys(r); }
     for (let i = rocks.length - 1; i >= 0; i--) if (rocks[i].y - rocks[i].r > H) rocks.splice(i, 1);
     if (rocks.length < 6 && Math.random() < dt * 0.6) {
-      const tier = TIERS[1 + Math.floor(Math.random() * 2)];
+      const tier = TIERS[2 + Math.floor(Math.random() * 2)];
       const rr = rand(tier.rMin, tier.rMax);
       rocks.push(makeRock(tier, rand(rr, W - rr), -rr, rr, rnd11() * 10, rand(40, 80)));
     }
@@ -825,9 +1082,12 @@
     ctx.save();
     if (shake > 0) ctx.translate(rnd11() * shake, rnd11() * shake);
     drawBackground(t);
+    if (quasar) drawQuasar(quasar, t);
+    for (const h of holes) drawHole(h, t);
     for (const r of rocks) drawRock(r);
     drawParticles();
     if (state === "playing" || state === "paused") drawShip(t);
+    if (quasar) drawBeams(quasar, t);
     drawPopups();
     ctx.restore();
     if (flash > 0) { ctx.fillStyle = `rgba(255,80,60,${flash * 0.6})`; ctx.fillRect(0, 0, W, H); }
@@ -847,7 +1107,12 @@
     get score() { return score; },
     get ship() { return ship; },
     get rocks() { return rocks; },
+    get holes() { return holes; },
+    set holeTimer(v) { holeTimer = v; },
     setLevel(n) { level = n; elapsed = n * CFG.levelTime; },
+    step(sec) { const n = Math.round(sec / STEP); for (let i = 0; i < n; i++) update(STEP); },
+    hole(x, y) { const h = makeHole(); if (x != null) { h.x = x; h.y = y; } holes.push(h); return h; },
+    quasar(twin) { quasar = makeQuasar(!!twin); quasar.t = 0.5; return quasar; },
     spawn(tierIdx, x, y) {
       const tier = TIERS[tierIdx]; const r = rand(tier.rMin, tier.rMax);
       rocks.push(makeRock(tier, x ?? W / 2, y ?? H * 0.3, r, 0, 0)); return rocks[rocks.length - 1];
